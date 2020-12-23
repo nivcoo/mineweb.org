@@ -144,6 +144,12 @@
     "repo": "MineWeb/Plugin-Links"
   },
   {
+    "name": "PatchNotes",
+    "slug": "PatchNotes",
+    "free": true,
+    "repo": "MineWeb/Plugin-PatchNotes"
+  },
+  {
     "name": "Wiki",
     "slug": "Wiki",
     "free": true,
