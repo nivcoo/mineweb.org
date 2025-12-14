@@ -1,0 +1,214 @@
+name: Market refresh
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: market-refresh
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Refresh market (plugins + themes)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FALLBACK_BRANCH: 2.X
+          MANIFEST_PATH: manifest.json
+          PLUGINS_PATH: market/plugins.json
+          THEMES_PATH: market/themes.json
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const TOKEN = process.env.GITHUB_TOKEN || '';
+          const FALLBACK_BRANCH = (process.env.FALLBACK_BRANCH || '2.X').trim();
+          const MANIFEST_PATH = (process.env.MANIFEST_PATH || 'manifest.json').trim();
+          const PLUGINS_PATH = process.env.PLUGINS_PATH;
+          const THEMES_PATH = process.env.THEMES_PATH;
+
+          function ghHeaders() {
+            const h = { 'User-Agent': 'MineWebMarketBot', 'Accept': 'application/vnd.github+json' };
+            if (TOKEN) h['Authorization'] = `Bearer ${TOKEN}`;
+            return h;
+          }
+
+          async function httpJson(url, headers = {}) {
+            const res = await fetch(url, { headers });
+            const text = await res.text();
+            let json = null;
+            try { json = JSON.parse(text); } catch {}
+            return { status: res.status, json, text };
+          }
+
+          async function latestReleaseTag(repo) {
+            const url = `https://api.github.com/repos/${repo}/releases/latest`;
+            const { status, json } = await httpJson(url, ghHeaders());
+            if (status < 200 || status >= 300 || !json) return null;
+            const tag = (json.tag_name || json.name || '').toString().trim();
+            return tag || null;
+          }
+
+          async function fetchManifest(repo, ref) {
+            const url = `https://raw.githubusercontent.com/${repo}/${ref}/${MANIFEST_PATH}`;
+            const { status, json } = await httpJson(url, ghHeaders());
+            if (status === 404) return { ok: false, reason: 'MANIFEST_MISSING' };
+            if (status < 200 || status >= 300 || !json) return { ok: false, reason: 'MANIFEST_UNREADABLE' };
+            return { ok: true, manifest: json };
+          }
+
+          function pickBase(entry) {
+            const out = {};
+            if (entry && typeof entry === 'object') {
+              if (typeof entry.name === 'string') out.name = entry.name;
+              if (typeof entry.slug === 'string') out.slug = entry.slug;
+              if (typeof entry.free === 'boolean') out.free = entry.free;
+              if (typeof entry.repo === 'string') out.repo = entry.repo;
+              if (typeof entry.channel === 'string') out.channel = entry.channel;
+              if (typeof entry.branch === 'string') out.branch = entry.branch;
+            }
+            return out;
+          }
+
+          function normalizeType(v) {
+            return (v || '').toString().trim().toLowerCase();
+          }
+
+          function normalizeSlug(v) {
+            return (v || '').toString().trim();
+          }
+
+          function normalizeRepo(v) {
+            return (v || '').toString().trim();
+          }
+
+          async function resolveRef(base, repo) {
+            const channelRaw = (base.channel || 'release').toString().toLowerCase();
+
+            if (channelRaw === 'branch') {
+              const ref = (base.branch || FALLBACK_BRANCH).toString().trim() || FALLBACK_BRANCH;
+              return { channel: 'branch', ref };
+            }
+
+            const tag = await latestReleaseTag(repo);
+            if (tag) return { channel: 'release', ref: tag };
+
+            return { channel: 'branch', ref: FALLBACK_BRANCH };
+          }
+
+          async function enrichEntry(entry, kind) {
+            const base = pickBase(entry);
+            const slug = normalizeSlug(base.slug);
+            const repo = normalizeRepo(base.repo);
+
+            if (!slug || !repo) {
+              return { ...base, fetch: { channel: 'none', ref: null }, manifest: null, compatible: false, reason: 'INVALID_ENTRY' };
+            }
+
+            const { channel, ref } = await resolveRef(base, repo);
+
+            const man = await fetchManifest(repo, ref);
+            if (!man.ok) {
+              return { ...base, fetch: { channel, ref }, manifest: null, compatible: false, reason: man.reason };
+            }
+
+            const m = man.manifest || {};
+            const mType = normalizeType(m.type);
+            const mSlug = normalizeSlug(m.slug);
+            const mAuthor = (m.author || '').toString().trim();
+            const mVersion = (m.version || '').toString().trim();
+
+            const errors = [];
+            if (!mType || !mSlug || !mAuthor || !mVersion) errors.push('MANIFEST_INVALID');
+            if (mSlug && mSlug.toLowerCase() !== slug.toLowerCase()) errors.push('SLUG_MISMATCH');
+
+            if (kind === 'plugins' && mType !== 'addon') errors.push('TYPE_MISMATCH');
+            if (kind === 'themes' && mType !== 'theme') errors.push('TYPE_MISMATCH');
+
+            const requirements = (m.requirements && typeof m.requirements === 'object') ? m.requirements : {};
+
+            const out = {
+              ...base,
+              fetch: { channel, ref },
+              manifest: {
+                type: mType || null,
+                slug: mSlug || null,
+                name: (m.name || '').toString().trim() || null,
+                author: mAuthor || null,
+                version: mVersion || null,
+                repository: repo,
+                branch: ref,
+                requirements
+              }
+            };
+
+            if (errors.length > 0) {
+              out.compatible = false;
+              out.reason = errors.join('|');
+              return out;
+            }
+
+            out.compatible = true;
+            out.reason = null;
+            return out;
+          }
+
+          async function refreshFile(filePath, kind) {
+            const abs = path.resolve(filePath);
+            if (!fs.existsSync(abs)) {
+              throw new Error(`Missing file: ${filePath}`);
+            }
+
+            const raw = fs.readFileSync(abs, 'utf8');
+            const parsed = JSON.parse(raw);
+            if (!Array.isArray(parsed)) {
+              throw new Error(`${filePath} must be a JSON array`);
+            }
+
+            const enriched = [];
+            for (const entry of parsed) {
+              if (!entry || typeof entry !== 'object') continue;
+              enriched.push(await enrichEntry(entry, kind));
+            }
+
+            fs.writeFileSync(abs, JSON.stringify(enriched, null, 2) + '\n', 'utf8');
+            console.log(`Wrote ${filePath} (${enriched.length} entries)`);
+          }
+
+          async function main() {
+            await refreshFile(PLUGINS_PATH, 'plugins');
+            await refreshFile(THEMES_PATH, 'themes');
+          }
+
+          main().catch((e) => {
+            console.error(e);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Commit and push if changed
+        run: |
+          if git diff --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+          git config user.name "MineWeb Market Bot"
+          git config user.email "market-bot@users.noreply.github.com"
+          git add market/plugins.json market/themes.json
+          git commit -m "market: refresh plugins/themes metadata"
+          git push
