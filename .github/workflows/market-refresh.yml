@@ -31,6 +31,7 @@ jobs:
           MANIFEST_PATH: manifest.json
           PLUGINS_PATH: market/plugins.json
           THEMES_PATH: market/themes.json
+          LOCALES_PATH: resources/locales
         run: |
           node - <<'NODE'
           const fs = require('fs');
@@ -41,6 +42,7 @@ jobs:
           const MANIFEST_PATH = (process.env.MANIFEST_PATH || 'manifest.json').trim();
           const PLUGINS_PATH = process.env.PLUGINS_PATH;
           const THEMES_PATH = process.env.THEMES_PATH;
+          const LOCALES_PATH = (process.env.LOCALES_PATH || 'resources/locales').trim().replace(/\/+$/, '');
 
           function ghHeaders() {
             const h = { 'User-Agent': 'MineWebMarketBot', 'Accept': 'application/vnd.github+json' };
@@ -48,12 +50,17 @@ jobs:
             return h;
           }
 
-          async function httpJson(url, headers = {}) {
+          async function httpText(url, headers = {}) {
             const res = await fetch(url, { headers });
             const text = await res.text();
+            return { status: res.status, text };
+          }
+
+          async function httpJson(url, headers = {}) {
+            const { status, text } = await httpText(url, headers);
             let json = null;
             try { json = JSON.parse(text); } catch {}
-            return { status: res.status, json, text };
+            return { status, json, text };
           }
 
           async function latestReleaseTag(repo) {
@@ -97,6 +104,19 @@ jobs:
             return (v || '').toString().trim();
           }
 
+          function normalizeLocale(v) {
+            return (v || '').toString().trim().replace(/-/g, '_');
+          }
+
+          function uniqueSorted(arr) {
+            const set = new Set();
+            for (const v of arr) {
+              const s = (v || '').toString().trim();
+              if (s) set.add(s);
+            }
+            return Array.from(set).sort((a, b) => a.localeCompare(b));
+          }
+
           async function resolveRef(base, repo) {
             const channelRaw = (base.channel || 'release').toString().toLowerCase();
 
@@ -109,6 +129,30 @@ jobs:
             if (tag) return { channel: 'release', ref: tag };
 
             return { channel: 'branch', ref: FALLBACK_BRANCH };
+          }
+
+          async function listLocalesFromRepo(repo, ref) {
+            const apiUrl = `https://api.github.com/repos/${repo}/contents/${LOCALES_PATH}?ref=${encodeURIComponent(ref)}`;
+            const { status, json } = await httpJson(apiUrl, ghHeaders());
+            if (status === 404 || !Array.isArray(json)) return [];
+            if (status < 200 || status >= 300) return [];
+
+            const locales = [];
+            for (const item of json) {
+              if (!item || typeof item !== 'object') continue;
+              if (item.type !== 'dir') continue;
+              const name = normalizeLocale(item.name);
+              if (!name) continue;
+              locales.push(name);
+            }
+            return uniqueSorted(locales);
+          }
+
+          function normalizeManifestLocales(m) {
+            if (!m || typeof m !== 'object') return [];
+            if (!Array.isArray(m.locales)) return [];
+            const locales = m.locales.map(normalizeLocale).filter(Boolean);
+            return uniqueSorted(locales);
           }
 
           async function enrichEntry(entry, kind) {
@@ -142,6 +186,10 @@ jobs:
 
             const requirements = (m.requirements && typeof m.requirements === 'object') ? m.requirements : {};
 
+            const declaredLocales = normalizeManifestLocales(m);
+            const scannedLocales = await listLocalesFromRepo(repo, ref);
+            const locales = uniqueSorted([...declaredLocales, ...scannedLocales]);
+
             const out = {
               ...base,
               fetch: { channel, ref },
@@ -153,7 +201,8 @@ jobs:
                 version: mVersion || null,
                 repository: repo,
                 branch: ref,
-                requirements
+                requirements,
+                locales
               }
             };
 
